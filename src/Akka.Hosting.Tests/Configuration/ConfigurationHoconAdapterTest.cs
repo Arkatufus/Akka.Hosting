@@ -8,7 +8,6 @@
 using System;
 using System.IO;
 using System.Text;
-using Akka.Configuration;
 using Akka.Hosting.Configuration;
 using FluentAssertions;
 using FluentAssertions.Extensions;
@@ -42,7 +41,7 @@ public class ConfigurationHoconAdapterTest
   ""test4"": 4
 }";
 
-    private readonly Config _config;
+    private readonly IConfigurationBuilder _builder;
 
     public ConfigurationHoconAdapterTest()
     {
@@ -53,30 +52,77 @@ public class ConfigurationHoconAdapterTest
         Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_2__22", "TWO");
         Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_2__1", "ONE");
         
-        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(ConfigSource));
-        var configuration = new ConfigurationBuilder()
-            .AddJsonStream(stream)
-            .AddEnvironmentVariables()
-            .Build();
-        _config = configuration.ToHocon();
+        var stream = new MemoryStream(Encoding.UTF8.GetBytes(ConfigSource));
+        _builder = new ConfigurationBuilder()
+            .AddJsonStream(stream);
     }
 
     [Fact(DisplayName = "Adaptor should read environment variable sourced configuration correctly")]
     public void EnvironmentVariableTest()
     {
-        _config.GetString("akka.test-value-1.a").Should().Be("A VALUE");
-        _config.GetString("akka.test-value-1.b").Should().Be("B VALUE");
-        _config.GetString("akka.test-value-1.c.d").Should().Be("D");
-        var array = _config.GetStringList("akka.test-value-2");
-        array[0].Should().Be("ZERO");
-        array[1].Should().Be("ONE");
-        array[2].Should().Be("TWO");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_1__A", "A VALUE");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_1__B", "B VALUE");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_1__C__D", "D");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_2__0", "ZERO");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_2__22", "TWO");
+        Environment.SetEnvironmentVariable("Akka__Test_Value_2__1", "ONE");
+
+        try
+        {
+            var configRoot = _builder.AddEnvironmentVariables().Build();
+            var config = configRoot.ToHocon();
+            
+            config.GetString("akka.test-value-1.a").Should().Be("A VALUE");
+            config.GetString("akka.test-value-1.b").Should().Be("B VALUE");
+            config.GetString("akka.test-value-1.c.d").Should().Be("D");
+            var array = config.GetStringList("akka.test-value-2");
+            array[0].Should().Be("ZERO");
+            array[1].Should().Be("ONE");
+            array[2].Should().Be("TWO");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_1__A", null);
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_1__B", null);
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_1__C__D", null);
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_2__0", null);
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_2__22", null);
+            Environment.SetEnvironmentVariable("AKKA__TEST_VALUE_2__1", null);
+        }
+    }
+    
+    [Fact(DisplayName = "Adapter should bind environment variable sourced configuration correctly")]
+    public void EnvironmentVariableBindTest()
+    {
+        Environment.SetEnvironmentVariable("Akka__TestValues__0", "0");
+        Environment.SetEnvironmentVariable("Akka__TestValues__1", "1");
+        Environment.SetEnvironmentVariable("Akka__TestValues__2", "2");
+        Environment.SetEnvironmentVariable("Akka__TestString", "ZERO");
+
+        try
+        {
+            var config = _builder.AddEnvironmentVariables().Build();
+            var bound = config.GetSection("Akka").Get<BindTest>();
+            bound.TestValues.Should().BeEquivalentTo( new []{0, 1, 2});
+            bound.TestString.Should().Be("ZERO");
+            bound.EmptyOne.Should().BeNull();
+            bound.EmptyTwo.Should().BeNull();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("Akka__TestValues__0", null);
+            Environment.SetEnvironmentVariable("Akka__TestValues__1", null);
+            Environment.SetEnvironmentVariable("Akka__TestValues__2", null);
+            Environment.SetEnvironmentVariable("Akka__TestString", null);
+        }
     }
     
     [Fact(DisplayName = "Adaptor should expand keys")]
     public void EncodedKeyTest()
     {
-        var test2 = _config.GetConfig("test2");
+        var config = _builder.Build().ToHocon();
+        
+        var test2 = config.GetConfig("test2");
         test2.Should().NotBeNull();
         test2.GetBoolean("a").Should().BeTrue();
         test2.GetTimeSpan("b.c").Should().Be(2.Seconds());
@@ -87,17 +133,27 @@ public class ConfigurationHoconAdapterTest
     [Fact(DisplayName = "Adaptor should convert correctly")]
     public void ArrayTest()
     {
-        _config.GetString("test1").Should().Be("test1 content");
-        _config.GetInt("test3").Should().Be(3);
-        _config.GetInt("test4").Should().Be(4);
+        var config = _builder.Build().ToHocon();
         
-        _config.GetStringList("akka.cluster.roles").Should().BeEquivalentTo("front-end", "back-end");
-        _config.GetInt("akka.cluster.role.back-end").Should().Be(5);
-        _config.GetString("akka.cluster.app-version").Should().Be("1.0.0");
-        _config.GetInt("akka.cluster.min-nr-of-members").Should().Be(99);
-        _config.GetStringList("akka.cluster.seed-nodes").Should()
+        config.GetString("test1").Should().Be("test1 content");
+        config.GetInt("test3").Should().Be(3);
+        config.GetInt("test4").Should().Be(4);
+        
+        config.GetStringList("akka.cluster.roles").Should().BeEquivalentTo("front-end", "back-end");
+        config.GetInt("akka.cluster.role.back-end").Should().Be(5);
+        config.GetString("akka.cluster.app-version").Should().Be("1.0.0");
+        config.GetInt("akka.cluster.min-nr-of-members").Should().Be(99);
+        config.GetStringList("akka.cluster.seed-nodes").Should()
             .BeEquivalentTo("akka.tcp://system@somewhere.com:9999");
-        _config.GetBoolean("akka.cluster.log-info").Should().BeFalse();
-        _config.GetBoolean("akka.cluster.log-info-verbose").Should().BeTrue();
+        config.GetBoolean("akka.cluster.log-info").Should().BeFalse();
+        config.GetBoolean("akka.cluster.log-info-verbose").Should().BeTrue();
+    }
+    
+    private class BindTest
+    {
+        public int[]? TestValues { get; set; }
+        public string? TestString { get; set; }
+        public int? EmptyOne { get; set; }
+        public string? EmptyTwo { get; set; }
     }
 }
