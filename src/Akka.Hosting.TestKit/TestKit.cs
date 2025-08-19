@@ -29,7 +29,7 @@ using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Akka.Hosting.TestKit
 {
-    public abstract class TestKit: TestKitBase, IAsyncLifetime
+    public abstract partial class TestKit: TestKitBase, IAsyncLifetime
     {
         /// <summary>
         /// Commonly used assertions used throughout the testkit.
@@ -56,6 +56,9 @@ namespace Akka.Hosting.TestKit
 
         private readonly TaskCompletionSource<Done> _initialized = new TaskCompletionSource<Done>();
 
+        private readonly TestKitThread _kitThread;
+        private readonly TaskCompletionSource<Done> _readyTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        
         protected TestKit(string? actorSystemName = null, ITestOutputHelper? output = null, TimeSpan? startupTimeout = null, LogLevel logLevel = LogLevel.Information)
         : base(Assertions)
         {
@@ -63,6 +66,9 @@ namespace Akka.Hosting.TestKit
             Output = output;
             LogLevel = logLevel;
             StartupTimeout = startupTimeout ?? TimeSpan.FromSeconds(10);
+            
+            // spin the TestKit thread once
+            _kitThread = new TestKitThread("Akka.Hosting.TestKit");
         }
         
         protected virtual void ConfigureHostConfiguration(IConfigurationBuilder builder)
@@ -104,15 +110,20 @@ namespace Akka.Hosting.TestKit
 
                 builder.StartActors((system, registry) =>
                 {
-                    try
+                    // Run the classic TestKit init on the TestKit thread
+                    // This preserves InternalCurrentActorCellKeeper.Current + SyncContext invariants.
+                    _kitThread.InvokeAsync(() =>
                     {
-                        base.InitializeTest(system, (ActorSystemSetup)null!, null, null);
-                        registry.Register<TestProbe>(TestActor);
-                    }
-                    catch (Exception e)
-                    {
-                        _initialized.SetException(e);
-                    }
+                        try
+                        {
+                            base.InitializeTest(system, (ActorSystemSetup)null!, null, null);
+                            registry.Register<TestProbe>(TestActor);
+                        }
+                        catch (Exception e)
+                        {
+                            _initialized.SetException(e);
+                        }
+                    }).GetAwaiter().GetResult(); // OK to block: work runs on a different thread.
                 });
 
                 ConfigureAkka(builder, provider);
@@ -158,22 +169,24 @@ namespace Akka.Hosting.TestKit
 
             _host = hostBuilder.Build();
 
-            var cts = new CancellationTokenSource(StartupTimeout);
-            cts.Token.Register(() =>
-                throw new TimeoutException($"Host failed to start within {StartupTimeout.Seconds} seconds"));
-            try
+            using (var cts = new CancellationTokenSource(StartupTimeout))
             {
+                cts.Token.Register(() =>
+                    throw new TimeoutException($"Host failed to start within {StartupTimeout.Seconds} seconds"));
                 await _host.StartAsync(cts.Token);
-            }
-            finally
-            {
-                cts.Dispose();
             }
 
             await _initialized.Task;
             
             if (this is not INoImplicitSender && InternalCurrentActorCellKeeper.Current is null)
                 InternalCurrentActorCellKeeper.Current = (ActorCell)((ActorRefWithCell)TestActor).Underlying;
+            
+            await _kitThread.InvokeAsync(() =>
+            {
+                // e.g., subscribe event stream, connect output, set time dilation, etc.
+                // important: anything that assumes TestKit thread invariants lives here
+                _readyTcs.TrySetResult(Done.Instance);
+            });
             
             await BeforeTestStart();
         }
@@ -232,6 +245,7 @@ namespace Akka.Hosting.TestKit
                 }
                 finally
                 {
+                    _kitThread.Dispose();
                     _host?.Dispose();
                 }
                 
@@ -252,6 +266,41 @@ namespace Akka.Hosting.TestKit
                 _ => Event.LogLevel.ErrorLevel
             };
         
+        private async Task AwaitReadyThen(Func<Task> f)
+        {
+            // If late init isn't complete yet, await it here. This is hosting-only behavior.
+            var ready = _readyTcs.Task;
+            if (!ready.IsCompleted) 
+                await ready;
+            await f();
+        }
+        
+        private async Task AwaitReadyThen(Func<ValueTask> f)
+        {
+            // If late init isn't complete yet, await it here. This is hosting-only behavior.
+            var ready = _readyTcs.Task;
+            if (!ready.IsCompleted) 
+                await ready;
+            await f();
+        }
+        
+        private async Task<T> AwaitReadyThen<T>(Func<Task<T>> f)
+        {
+            // If late init isn't complete yet, await it here. This is hosting-only behavior.
+            var ready = _readyTcs.Task;
+            if (!ready.IsCompleted) 
+                await ready;
+            return await f();
+        }
+        
+        private async ValueTask<T> AwaitReadyThen<T>(Func<ValueTask<T>> f)
+        {
+            // If late init isn't complete yet, await it here. This is hosting-only behavior.
+            var ready = _readyTcs.Task;
+            if (!ready.IsCompleted) 
+                await ready;
+            return await f();
+        }
     }    
 }
 
